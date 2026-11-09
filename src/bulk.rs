@@ -21,12 +21,13 @@
 //! writer.add(b"banana", b"yellow").unwrap();
 //! let table = writer.finish().unwrap().unwrap();
 //!
-//! install_tables(&opt, db, level_for_size(table.size as u64), vec![table]).unwrap();
+//! install_tables(&opt, db, level_for_size(table.size() as u64), vec![table]).unwrap();
 //!
 //! let mut db = DB::open(db, opt).unwrap();
 //! assert_eq!(b"yellow", &*db.get(b"banana").unwrap());
 //! ```
 
+use crate::env::Env;
 use crate::error::{err, Result, StatusCode};
 use crate::key_types::{LookupKey, ValueType};
 use crate::log::LogWriter;
@@ -50,20 +51,36 @@ const LEVEL_1_MAX_BYTES: u64 = 10 << 20;
 /// A finished table file, as [`install_tables`] needs it. `Send`, unlike the writer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BulkTable {
-    /// The number the file is named after.
-    pub num: FileNum,
-    /// Size of the file in bytes.
-    pub size: usize,
-    /// Number of entries in the table.
-    pub entries: usize,
-    /// Highest sequence number of the table's entries.
-    pub last_seq: SequenceNumber,
+    num: FileNum,
+    size: usize,
+    entries: usize,
+    last_seq: SequenceNumber,
     // Both in internal key format, as the manifest stores them.
     smallest: Vec<u8>,
     largest: Vec<u8>,
 }
 
 impl BulkTable {
+    /// The number the file is named after.
+    pub fn num(&self) -> FileNum {
+        self.num
+    }
+
+    /// Size of the file in bytes.
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// Number of entries in the table.
+    pub fn entries(&self) -> usize {
+        self.entries
+    }
+
+    /// Highest sequence number of the table's entries.
+    pub fn last_seq(&self) -> SequenceNumber {
+        self.last_seq
+    }
+
     /// The first key of the table.
     pub fn smallest_key(&self) -> &[u8] {
         user_key(&self.smallest)
@@ -80,11 +97,33 @@ fn user_key(internal_key: &[u8]) -> &[u8] {
     &internal_key[..internal_key.len() - 8]
 }
 
+/// Whether `db` holds a database, or the log or manifest of one. A log left behind would be
+/// replayed into the new database when it is opened.
+fn holds_database(env: &dyn Env, db: &Path) -> Result<bool> {
+    if env.exists(&current_file_name(db))? {
+        return Ok(true);
+    }
+    Ok(env.children(db)?.iter().any(|child| {
+        let name = child.to_string_lossy();
+        name.starts_with("MANIFEST-") || name.ends_with(".log")
+    }))
+}
+
+fn refuse_existing_database<T>() -> Result<T> {
+    err(
+        StatusCode::AlreadyExists,
+        "the directory already holds a database",
+    )
+}
+
 /// Writes one table file of a database that is being bulk loaded.
 pub struct TableWriter {
     opt: Options,
     path: PathBuf,
     builder: Option<TableBuilder<BufWriter<Box<dyn Write>>>>,
+    /// Set by a failed write. The table builder cannot go on after one, so the writer
+    /// refuses instead of handing it another entry.
+    failed: bool,
     num: FileNum,
     next_seq: SequenceNumber,
     entries: usize,
@@ -94,7 +133,8 @@ pub struct TableWriter {
 
 impl TableWriter {
     /// Creates the table file numbered `num` in the database directory `db`, which must
-    /// exist. Entries get consecutive sequence numbers from `first_seq` on.
+    /// exist and must not hold a database: a table of that number would be overwritten.
+    /// Entries get consecutive sequence numbers from `first_seq` on.
     ///
     /// File numbers must be unique within the database and greater than zero. Sequence
     /// numbers need not be unique across tables, since no key occurs twice.
@@ -104,11 +144,18 @@ impl TableWriter {
         num: FileNum,
         first_seq: SequenceNumber,
     ) -> Result<TableWriter> {
-        if num == 0 {
-            return err(StatusCode::InvalidArgument, "table file number 0");
+        // The manifest takes the number after the highest table.
+        if num == 0 || num >= FileNum::MAX - 1 {
+            return err(
+                StatusCode::InvalidArgument,
+                "table file number out of range",
+            );
         }
-        if first_seq > MAX_SEQUENCE_NUMBER {
+        if first_seq >= MAX_SEQUENCE_NUMBER {
             return err(StatusCode::InvalidArgument, "sequence number out of range");
+        }
+        if opt.env.exists(&current_file_name(db))? {
+            return refuse_existing_database();
         }
         let path = table_file_name(db, num);
         let file = opt.env.open_writable_file(&path)?;
@@ -117,6 +164,7 @@ impl TableWriter {
             opt: opt.clone(),
             path,
             builder: Some(TableBuilder::new(opt.clone(), dst)),
+            failed: false,
             num,
             next_seq: first_seq,
             entries: 0,
@@ -126,22 +174,34 @@ impl TableWriter {
     }
 
     /// Adds an entry. Keys must be added in strictly ascending order of the comparator.
+    ///
+    /// After an error from the file or the compressor the table is lost: every later call
+    /// returns an error, and [`finish`](TableWriter::finish) removes the file.
     pub fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        if self.failed {
+            return err(StatusCode::IOError, "an earlier write to the table failed");
+        }
         if self.entries > 0 && self.opt.cmp.cmp(user_key(&self.largest), key) != Ordering::Less {
             return err(
                 StatusCode::InvalidArgument,
                 "bulk-loaded keys must be strictly ascending",
             );
         }
-        if self.next_seq > MAX_SEQUENCE_NUMBER {
+        // The highest sequence number stays free for the database's own writes.
+        if self.next_seq >= MAX_SEQUENCE_NUMBER {
             return err(StatusCode::InvalidArgument, "sequence number out of range");
         }
         let internal = LookupKey::new_full(key, self.next_seq, ValueType::TypeValue);
         let internal = internal.internal_key();
-        self.builder
+        let added = self
+            .builder
             .as_mut()
             .expect("builder is present until finish")
-            .add(internal, value)?;
+            .add(internal, value);
+        if added.is_err() {
+            self.failed = true;
+        }
+        added?;
         if self.entries == 0 {
             self.smallest = internal.to_vec();
         }
@@ -165,18 +225,30 @@ impl TableWriter {
             .size_estimate()
     }
 
-    /// Finishes the file. A writer that got no entry leaves no file and returns `None`.
+    /// Finishes the file. A writer that got no entry leaves no file and returns `None`,
+    /// and one whose write failed removes what it wrote and returns an error.
     pub fn finish(mut self) -> Result<Option<BulkTable>> {
         let builder = self
             .builder
             .take()
             .expect("builder is present until finish");
+        if self.failed {
+            drop(builder);
+            let _ = self.opt.env.delete(&self.path);
+            return err(StatusCode::IOError, "an earlier write to the table failed");
+        }
         if self.entries == 0 {
             drop(builder);
             self.opt.env.delete(&self.path)?;
             return Ok(None);
         }
-        let size = builder.finish()?;
+        let size = match builder.finish() {
+            Ok(size) => size,
+            Err(e) => {
+                let _ = self.opt.env.delete(&self.path);
+                return Err(e);
+            }
+        };
         Ok(Some(BulkTable {
             num: self.num,
             size,
@@ -189,11 +261,12 @@ impl TableWriter {
 }
 
 /// The shallowest level a bulk load of `total_bytes` fits without being compacted further
-/// on the first open: level 1 up to 10 MiB, ten times more on each level below it.
+/// on the first open: level 1 below 10 MiB, ten times more on each level below it. A level
+/// that is exactly full is already due for compaction.
 pub fn level_for_size(total_bytes: u64) -> usize {
     let mut level = 1;
     let mut max_bytes = LEVEL_1_MAX_BYTES;
-    while total_bytes > max_bytes && level < NUM_LEVELS - 1 {
+    while total_bytes >= max_bytes && level < NUM_LEVELS - 1 {
         level += 1;
         max_bytes = max_bytes.saturating_mul(10);
     }
@@ -202,8 +275,10 @@ pub fn level_for_size(total_bytes: u64) -> usize {
 
 /// Makes `tables` the contents of a new database in the directory `db`, all on `level`.
 ///
-/// The tables must cover disjoint key ranges, as the files of every level but the first do.
-/// The directory must not hold a database yet. No entries may be passed.
+/// The tables must cover disjoint key ranges, as the files of every level but the first do,
+/// and must have been written into `db` through the same `Env`. The directory must not
+/// hold a database yet, nor the log or manifest of one. An empty list makes an empty
+/// database.
 pub fn install_tables(
     opt: &Options,
     db: &Path,
@@ -214,11 +289,8 @@ pub fn install_tables(
         return err(StatusCode::InvalidArgument, "no such level");
     }
     let env = opt.env.as_ref().as_ref();
-    if env.exists(&current_file_name(db))? {
-        return err(
-            StatusCode::AlreadyExists,
-            "the directory already holds a database",
-        );
+    if holds_database(env, db)? {
+        return refuse_existing_database();
     }
 
     tables.sort_by(|a, b| opt.cmp.cmp(a.smallest_key(), b.smallest_key()));
@@ -236,6 +308,16 @@ pub fn install_tables(
         return err(StatusCode::InvalidArgument, "duplicate table file number");
     }
 
+    for table in &tables {
+        if env.size_of(&table_file_name(db, table.num))? != table.size {
+            return err(
+                StatusCode::InvalidArgument,
+                "a table file differs from what its writer finished",
+            );
+        }
+    }
+
+    // `TableWriter::create` keeps the numbers low enough for these two to fit.
     let manifest_num = nums.last().map_or(1, |last| last + 1);
     let mut edit = VersionEdit::new();
     edit.set_comparator_name(opt.cmp.id());
@@ -257,7 +339,8 @@ pub fn install_tables(
 
     {
         let manifest = env.open_writable_file(&manifest_file_name(db, manifest_num))?;
-        let mut log = LogWriter::new(manifest);
+        // The log writer may write a record in pieces; buffered, a short write cannot split one.
+        let mut log = LogWriter::new(BufWriter::new(manifest));
         log.add_record(&edit.encode())?;
         log.flush()?;
     }
@@ -303,8 +386,13 @@ mod tests {
         assert_eq!(tables.len(), 7);
         assert_eq!(tables[0].smallest_key(), key(0));
         assert_eq!(tables[0].largest_key(), key(299));
-        assert_eq!(tables[6].last_seq, COUNT as u64);
-        let total: u64 = tables.iter().map(|t| t.size as u64).sum();
+        assert_eq!(tables[6].last_seq(), COUNT as u64);
+        assert_eq!(tables[6].entries(), COUNT - 6 * 300);
+        for table in &tables {
+            let file = table_file_name(db, table.num());
+            assert_eq!(opt.env.size_of(&file).unwrap(), table.size());
+        }
+        let total: u64 = tables.iter().map(|t| t.size() as u64).sum();
         // Installed in any order.
         tables.reverse();
         install_tables(&opt, db, level_for_size(total), tables).unwrap();
@@ -410,25 +498,172 @@ mod tests {
                 .code,
             StatusCode::InvalidArgument
         );
+    }
 
-        install_tables(&opt, db, 1, vec![table(6, &[b"a"])]).unwrap();
+    #[test]
+    fn a_directory_that_holds_a_database_is_left_alone() {
+        let opt = options::for_test();
+        let db = Path::new("bulk");
+        let mut writer = TableWriter::create(&opt, db, 1, 1).unwrap();
+        writer.add(b"a", b"first").unwrap();
+        let table = writer.finish().unwrap().unwrap();
+        let size = table.size();
+        install_tables(&opt, db, 1, vec![table.clone()]).unwrap();
+
+        // A second load must not get as far as truncating the live table of that number.
+        let refused = TableWriter::create(&opt, db, 1, 1).err().unwrap();
+        assert_eq!(refused.code, StatusCode::AlreadyExists);
+        assert_eq!(opt.env.size_of(&table_file_name(db, 1)).unwrap(), size);
         assert_eq!(
-            install_tables(&opt, db, 1, vec![table(7, &[b"b"])])
-                .unwrap_err()
-                .code,
+            install_tables(&opt, db, 1, vec![table]).unwrap_err().code,
             StatusCode::AlreadyExists
         );
+
+        let mut db = DB::open(db, opt).unwrap();
+        assert_eq!(db.get(b"a").as_deref(), Some(&b"first"[..]));
+    }
+
+    #[test]
+    fn a_leftover_log_is_not_replayed_into_a_new_database() {
+        let opt = options::for_test();
+        let db = Path::new("bulk");
+        opt.env
+            .open_writable_file(&db.join("000007.log"))
+            .unwrap()
+            .write_all(b"stale")
+            .unwrap();
+        let mut writer = TableWriter::create(&opt, db, 1, 1).unwrap();
+        writer.add(b"a", b"v").unwrap();
+        let table = writer.finish().unwrap().unwrap();
+        assert_eq!(
+            install_tables(&opt, db, 1, vec![table]).unwrap_err().code,
+            StatusCode::AlreadyExists
+        );
+    }
+
+    #[test]
+    fn a_table_from_elsewhere_is_refused() {
+        let opt = options::for_test();
+        let mut writer = TableWriter::create(&opt, Path::new("other"), 1, 1).unwrap();
+        writer.add(b"a", b"v").unwrap();
+        let table = writer.finish().unwrap().unwrap();
+        assert!(install_tables(&opt, Path::new("bulk"), 1, vec![table]).is_err());
+    }
+
+    #[test]
+    fn a_key_and_its_zero_extension_are_both_found_across_a_block_boundary() {
+        let opt = options::for_test();
+        let db = Path::new("bulk");
+        let big = vec![7u8; opt.block_size * 2];
+        let mut writer = TableWriter::create(&opt, db, 1, 1).unwrap();
+        // Each value fills a block, so every key ends one and the next key starts another.
+        // Nothing sorts between "a" and "a\0", nor above the empty key and below "\0".
+        let keys: [&[u8]; 5] = [b"", b"\0", b"a", b"a\0", b"a\0\0"];
+        for key in keys {
+            writer.add(key, &big).unwrap();
+        }
+        let table = writer.finish().unwrap().unwrap();
+        install_tables(&opt, db, 1, vec![table]).unwrap();
+
+        let mut db = DB::open(db, opt).unwrap();
+        for key in keys {
+            assert_eq!(db.get(key).as_deref(), Some(&big[..]), "key {key:?}");
+        }
+        assert!(db.get(b"a\0\0\0").is_none());
+    }
+
+    #[test]
+    fn a_writer_that_failed_refuses_instead_of_panicking() {
+        let mut opt = options::for_test();
+        // No compressor is registered under this id, so the first block fails to write.
+        opt.compressor = 42;
+        let db = Path::new("bulk");
+        let big = vec![7u8; opt.block_size * 2];
+        let mut writer = TableWriter::create(&opt, db, 1, 1).unwrap();
+        writer.add(b"a", &big).unwrap();
+        assert!(writer.add(b"b", &big).is_err());
+        assert!(writer.add(b"c", &big).is_err());
+        assert!(writer.finish().is_err());
+        assert!(!opt.env.exists(&table_file_name(db, 1)).unwrap());
+    }
+
+    #[test]
+    fn numbers_at_the_end_of_their_range_are_refused() {
+        let opt = options::for_test();
+        let db = Path::new("bulk");
+        assert!(TableWriter::create(&opt, db, FileNum::MAX - 1, 1).is_err());
+        assert!(TableWriter::create(&opt, db, 1, MAX_SEQUENCE_NUMBER).is_err());
+        let mut writer = TableWriter::create(&opt, db, 1, MAX_SEQUENCE_NUMBER - 1).unwrap();
+        writer.add(b"a", b"v").unwrap();
+        assert_eq!(
+            writer.add(b"b", b"v").unwrap_err().code,
+            StatusCode::InvalidArgument
+        );
+        assert_eq!(
+            writer.finish().unwrap().unwrap().last_seq(),
+            MAX_SEQUENCE_NUMBER - 1
+        );
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn a_bulk_loaded_database_on_disk_survives_writes_and_a_reopen() {
+        let dir = std::env::temp_dir().join(format!("rusty-leveldb-bulk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let opt = Options::default();
+        let tables = build_tables(&opt, &dir, 900, 200);
+        let empty = TableWriter::create(&opt, &dir, 99, 1).unwrap();
+        assert!(empty.finish().unwrap().is_none());
+        assert!(!dir.join("000099.ldb").exists());
+        install_tables(&opt, &dir, 2, tables).unwrap();
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "000001.ldb",
+                "000002.ldb",
+                "000003.ldb",
+                "000004.ldb",
+                "000005.ldb",
+                "CURRENT",
+                "MANIFEST-000006"
+            ]
+        );
+
+        for reuse_manifest in [true, false] {
+            let opt = Options {
+                reuse_manifest,
+                ..Options::default()
+            };
+            let mut db = DB::open(&dir, opt).unwrap();
+            assert_eq!(db.get(&key(450)).as_deref(), Some(&value(450)[..]));
+            db.put(&key(3), b"later").unwrap();
+            db.put(b"zzz", b"new").unwrap();
+            db.close().unwrap();
+        }
+        let mut db = DB::open(&dir, Options::default()).unwrap();
+        assert_eq!(db.get(&key(3)).as_deref(), Some(&b"later"[..]));
+        assert_eq!(db.get(b"zzz").as_deref(), Some(&b"new"[..]));
+        assert_eq!(db.get(&key(899)).as_deref(), Some(&value(899)[..]));
+        drop(db);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn the_level_grows_with_the_size() {
         const MIB: u64 = 1 << 20;
         assert_eq!(level_for_size(0), 1);
-        assert_eq!(level_for_size(10 * MIB), 1);
-        assert_eq!(level_for_size(10 * MIB + 1), 2);
-        assert_eq!(level_for_size(100 * MIB), 2);
-        assert_eq!(level_for_size(1000 * MIB), 3);
-        assert_eq!(level_for_size(10_000 * MIB + 1), 5);
+        assert_eq!(level_for_size(10 * MIB - 1), 1);
+        // A level that is exactly full would be compacted on the first open.
+        assert_eq!(level_for_size(10 * MIB), 2);
+        assert_eq!(level_for_size(100 * MIB - 1), 2);
+        assert_eq!(level_for_size(100 * MIB), 3);
+        assert_eq!(level_for_size(10_000 * MIB), 5);
         assert_eq!(level_for_size(u64::MAX), NUM_LEVELS - 1);
     }
 }
