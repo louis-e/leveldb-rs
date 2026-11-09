@@ -141,8 +141,10 @@ impl Cmp for InternalKeyCmp {
                 .to_vec();
         }
         // A separator that is `b`'s user key would sort after `b` whenever `a` has the lower
-        // sequence number, and a lookup of that key would then stop one block early.
-        if self.0.cmp(&sep, keyb) != Ordering::Less {
+        // sequence number, and a lookup of that key would then stop one block early. One
+        // that is `a`'s user key is `a` itself, tag and all: rebuilt as a value it would
+        // sort before `a` if `a` is a deletion.
+        if self.0.cmp(&sep, keyb) != Ordering::Less || self.0.cmp(&sep, keya) != Ordering::Greater {
             return a.to_vec();
         }
         LookupKey::new(&sep, seqa).internal_key().to_vec()
@@ -246,6 +248,40 @@ mod tests {
             DefaultCmp.find_short_succ(&[0xff, 0xff, 0xff]),
             &[0xff, 0xff, 0xff, 0xff]
         );
+    }
+
+    #[test]
+    fn test_cmp_separator_stays_between_the_keys() {
+        use crate::key_types::ValueType;
+        let cmp = InternalKeyCmp(Rc::new(Box::new(DefaultCmp)));
+        let key =
+            |user: &[u8], seq, typ| LookupKey::new_full(user, seq, typ).internal_key().to_vec();
+        // Nothing sorts between a key and the same key with a zero byte appended, between
+        // two entries of one key, or above the empty key and below "\0": the block's last
+        // key is the separator then, whatever the sequence numbers and types.
+        let pairs: [(&[u8], &[u8]); 4] = [
+            (b"abc", b"abc\0"),
+            (b"abc", b"abc"),
+            (b"", b"\0"),
+            (b"\xff\xff", b"\xff\xff\0"),
+        ];
+        for (a, b) in pairs {
+            for (seq_a, seq_b) in [(1, 2), (9, 2)] {
+                if a == b && seq_a < seq_b {
+                    // One key's entries are stored newest first.
+                    continue;
+                }
+                for typ in [ValueType::TypeValue, ValueType::TypeDeletion] {
+                    let (a, b) = (key(a, seq_a, typ), key(b, seq_b, ValueType::TypeValue));
+                    let sep = cmp.find_shortest_sep(&a, &b);
+                    assert_eq!(sep, a);
+                    assert!(cmp.cmp(&sep, &b) == Ordering::Less);
+                }
+            }
+        }
+        assert_eq!(DefaultCmp.find_shortest_sep(b"abc", b"abc\0"), b"abc");
+        assert_eq!(DefaultCmp.find_shortest_sep(b"", b"\0"), b"");
+        assert_eq!(DefaultCmp.find_shortest_sep(b"", b"x"), b"");
     }
 
     #[test]
