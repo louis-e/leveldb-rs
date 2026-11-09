@@ -135,17 +135,18 @@ impl Cmp for InternalKeyCmp {
 
         let sep: Vec<u8> = self.0.find_shortest_sep(keya, keyb);
 
-        if sep.len() < keya.len() && self.0.cmp(keya, &sep) == Ordering::Less {
+        // Only a user key strictly between the two separates them. One that is `b`'s user
+        // key would sort after `b` whenever `a` has the lower sequence number, and a lookup
+        // of that key would then stop one block early. One that is `a`'s user key is `a`
+        // itself, tag and all: rebuilt as a value it would sort before `a` if `a` is a
+        // deletion. The block's last key always does.
+        if self.0.cmp(&sep, keya) != Ordering::Greater || self.0.cmp(&sep, keyb) != Ordering::Less {
+            return a.to_vec();
+        }
+        if sep.len() < keya.len() {
             return LookupKey::new(&sep, types::MAX_SEQUENCE_NUMBER)
                 .internal_key()
                 .to_vec();
-        }
-        // A separator that is `b`'s user key would sort after `b` whenever `a` has the lower
-        // sequence number, and a lookup of that key would then stop one block early. One
-        // that is `a`'s user key is `a` itself, tag and all: rebuilt as a value it would
-        // sort before `a` if `a` is a deletion.
-        if self.0.cmp(&sep, keyb) != Ordering::Less || self.0.cmp(&sep, keya) != Ordering::Greater {
-            return a.to_vec();
         }
         LookupKey::new(&sep, seqa).internal_key().to_vec()
     }

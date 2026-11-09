@@ -45,6 +45,9 @@ use std::path::{Path, PathBuf};
 /// Buffer between the table builder and its file, so a block is one write, not three.
 const FILE_BUFFER_SIZE: usize = 64 << 10;
 
+/// Highest number a table may take, which leaves the database all the numbers it can use.
+const MAX_TABLE_NUMBER: FileNum = FileNum::MAX / 2;
+
 /// Largest total size of the files on level 1; each deeper level holds ten times more.
 const LEVEL_1_MAX_BYTES: u64 = 10 << 20;
 
@@ -144,8 +147,8 @@ impl TableWriter {
         num: FileNum,
         first_seq: SequenceNumber,
     ) -> Result<TableWriter> {
-        // The manifest takes the number after the highest table.
-        if num == 0 || num >= FileNum::MAX - 1 {
+        // The manifest and whatever the database creates later are numbered after the tables.
+        if num == 0 || num > MAX_TABLE_NUMBER {
             return err(
                 StatusCode::InvalidArgument,
                 "table file number out of range",
@@ -337,14 +340,20 @@ pub fn install_tables(
         );
     }
 
-    {
-        let manifest = env.open_writable_file(&manifest_file_name(db, manifest_num))?;
-        // The log writer may write a record in pieces; buffered, a short write cannot split one.
+    let manifest_path = manifest_file_name(db, manifest_num);
+    let written = (|| {
+        let manifest = env.open_writable_file(&manifest_path)?;
         let mut log = LogWriter::new(BufWriter::new(manifest));
         log.add_record(&edit.encode())?;
         log.flush()?;
+        drop(log);
+        set_current_file(env, db, manifest_num)
+    })();
+    if written.is_err() {
+        // Left behind, it would have the next attempt take the directory for a database.
+        let _ = env.delete(&manifest_path);
     }
-    set_current_file(env, db, manifest_num)
+    written
 }
 
 #[cfg(test)]
@@ -573,6 +582,35 @@ mod tests {
     }
 
     #[test]
+    fn the_last_key_of_a_block_is_found_at_its_own_sequence_number() {
+        // When nothing sorts between two keys, the index key of a block is its last entry
+        // itself, and a lookup that is exactly that entry must still look in the block.
+        let opt = options::for_test();
+        let db = Path::new("bulk");
+        let mut writer = TableWriter::create(&opt, db, 1, 1).unwrap();
+        writer.add(b"", b"only").unwrap();
+        let table = writer.finish().unwrap().unwrap();
+        install_tables(&opt, db, 1, vec![table]).unwrap();
+        let mut db = DB::open(db, opt).unwrap();
+        assert_eq!(db.get(b"").as_deref(), Some(&b"only"[..]));
+
+        // The same through a flush and a compaction: "a" is written last, so a lookup at
+        // the newest sequence number is the entry that ends the first block.
+        let opt = options::for_test();
+        let big = vec![7u8; opt.block_size * 2];
+        let mut db = DB::open("flushed", opt).unwrap();
+        db.put(b"a\0", &big).unwrap();
+        db.put(b"\0", &big).unwrap();
+        db.put(b"", &big).unwrap();
+        db.put(b"a", &big).unwrap();
+        db.flush().unwrap();
+        db.compact_range(b"", b"z").unwrap();
+        for key in [&b""[..], b"\0", b"a", b"a\0"] {
+            assert_eq!(db.get(key).as_deref(), Some(&big[..]), "key {key:?}");
+        }
+    }
+
+    #[test]
     fn a_writer_that_failed_refuses_instead_of_panicking() {
         let mut opt = options::for_test();
         // No compressor is registered under this id, so the first block fails to write.
@@ -591,7 +629,7 @@ mod tests {
     fn numbers_at_the_end_of_their_range_are_refused() {
         let opt = options::for_test();
         let db = Path::new("bulk");
-        assert!(TableWriter::create(&opt, db, FileNum::MAX - 1, 1).is_err());
+        assert!(TableWriter::create(&opt, db, FileNum::MAX / 2 + 1, 1).is_err());
         assert!(TableWriter::create(&opt, db, 1, MAX_SEQUENCE_NUMBER).is_err());
         let mut writer = TableWriter::create(&opt, db, 1, MAX_SEQUENCE_NUMBER - 1).unwrap();
         writer.add(b"a", b"v").unwrap();
