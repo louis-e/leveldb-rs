@@ -66,6 +66,10 @@ impl Cmp for DefaultCmp {
         // Try increasing a and check if it's still smaller than b. First find the last byte
         // smaller than 0xff, and then increment that byte. Only if the separator is lesser than b,
         // return it.
+        // The empty key has no byte to increase, and is its own separator from any `b`.
+        if a.is_empty() {
+            return sep;
+        }
         let mut i = a.len() - 1;
         while i > 0 && sep[i] == 0xff {
             i -= 1;
@@ -85,6 +89,11 @@ impl Cmp for DefaultCmp {
         // "abc\0", which is greater than abc and lesser than abd.
         // Append a 0 byte; by making it longer than a, it will compare greater to it.
         sep.extend_from_slice(&[0]);
+        // Unless that is `b` itself ("abc" vs "abc\0"): nothing lies between the two then,
+        // and a separator must stay below `b`.
+        if sep.as_slice() == b {
+            sep.pop();
+        }
         sep
     }
 
@@ -130,6 +139,11 @@ impl Cmp for InternalKeyCmp {
             return LookupKey::new(&sep, types::MAX_SEQUENCE_NUMBER)
                 .internal_key()
                 .to_vec();
+        }
+        // A separator that is `b`'s user key would sort after `b` whenever `a` has the lower
+        // sequence number, and a lookup of that key would then stop one block early.
+        if self.0.cmp(&sep, keyb) != Ordering::Less {
+            return a.to_vec();
         }
         LookupKey::new(&sep, seqa).internal_key().to_vec()
     }
